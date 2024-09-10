@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Protocol, cast
 
+import threading
 import zstandard
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
@@ -102,6 +103,7 @@ class Reader:
         path = Path(path)
         yamlpath = path / 'metadata.yaml'
         self.path = path
+        self.thread_local = threading.local()
         try:
             yaml = YAML(typ='safe')
             dct = cast(
@@ -165,11 +167,66 @@ class Reader:
             self.custom_data: dict[str, str] = self.metadata.get('custom_data', {})
 
             self.tmpdir: TemporaryDirectory[str] | None = None
-            self.storage: StorageProtocol | None = None
+            self._storage: StorageProtocol | None = None
         except KeyError as exc:
             msg = f'A metadata key is missing {exc!r}.'
             raise ReaderError(msg) from None
 
+    @property
+    def storage(self) -> StorageProtocol | None:
+        """Storage reader."""
+        if self.metadata['storage_identifier'] != 'sqlite3':
+            return self._storage
+            
+        verbose = False
+        if verbose:
+            prefix = f"Thread {threading.current_thread().name}:"
+            print(f"{prefix} storage getter.")
+        if not self._storage:
+            if verbose:
+                prefix = f"Thread {threading.current_thread().name}:"
+                print(f"{prefix} get None.")
+            return None
+        
+        if not hasattr(self.thread_local, "connection"):
+            _storage = self.STORAGE_PLUGINS[self.metadata['storage_identifier']](
+                self.storage_paths,
+                self.connections,
+            )
+            _storage.open()
+            self.thread_local.connection = _storage
+            
+            if verbose:
+                prefix = f"Thread {threading.current_thread().name}:"
+                print(f"{prefix} set New.")
+        else:
+            if verbose:
+                ret = self.thread_local.connection
+                prefix = f"Thread {threading.current_thread().name}:"
+                print(f"{prefix} get Old.")
+                print(f"{prefix} dbconns: {ret.dbconns}")
+        return self.thread_local.connection
+    
+    @storage.setter
+    def storage(self, value: StorageProtocol | None) -> StorageProtocol | None:
+        # print("storage setter")
+        self._storage = value
+        if self.metadata['storage_identifier'] != 'sqlite3':
+            return self._storage
+
+        if not hasattr(self.thread_local, "connection"):
+            # print(f"Thread {threading.current_thread().name} conns: {self.connections}")
+            # 为当前线程创建一个独立的 SQLite 连接
+            self.thread_local.connection = self.STORAGE_PLUGINS[self.metadata['storage_identifier']](
+                self.storage_paths,
+                self.connections,
+            )
+            # print(f"Thread {threading.current_thread().name}: set New.")
+        else:
+            # print(f"Thread {threading.current_thread().name}: set Old.")
+            self.thread_local.connection = value
+        return self.thread_local.connection
+    
     @property
     def duration(self) -> int:
         """Duration in nanoseconds between earliest and latest messages."""
@@ -228,6 +285,7 @@ class Reader:
         else:
             storage_paths = self.paths[:]
 
+        self.storage_paths = storage_paths
         self.storage = self.STORAGE_PLUGINS[self.metadata['storage_identifier']](
             storage_paths,
             self.connections,
